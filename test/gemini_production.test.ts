@@ -3,7 +3,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { classifyIntent } from '../server/services/intentClassifier.js'
 import { selectModelForTask, determineTaskTier } from '../server/services/modelRouter.js'
-import { classifyGeminiError, getSupportedGeminiModels } from '../server/services/aiService.js'
+import {
+  classifyGeminiError,
+  generateGeminiStream,
+  getSupportedGeminiModels,
+  normalizeGeminiChatHistory,
+} from '../server/services/aiService.js'
+import { DEFAULT_GEMINI_CHAT_MODEL, resolveGeminiChatModel } from '../server/services/geminiModel.js'
 import { orchestrateChat } from '../server/services/chatOrchestrator.js'
 import { chatHistoryService } from '../server/services/chatHistoryService.js'
 import { configService } from '../server/services/configService.js'
@@ -12,6 +18,8 @@ import { authService } from '../server/services/authService.js'
 process.env.NODE_ENV = 'test'
 delete process.env.AI_PROVIDER
 delete process.env.DEFAULT_AI_PROVIDER
+delete process.env.GEMINI_MODEL
+delete process.env.GEMINI_PRO_MODEL
 
 console.log('=== RUNNING MANA AI PRODUCTION-READY GEMINI AUDIT & REGRESSION TESTS ===\n')
 
@@ -124,13 +132,13 @@ async function main() {
     assert.strictEqual(selection.modelName, 'gemini-1.5-flash')
   })
 
-  // TEST 7: Deep Reasoning Mode follows documented model-routing rules
-  await runTest('Test 7: Deep Reasoning Mode selects Gemini Pro model', () => {
+  // TEST 7: Gemini uses the configured conversational model for reasoning too
+  await runTest('Test 7: Deep Reasoning Mode uses the configured Gemini chat model', () => {
     const cfg = { ...configService.getConfig(), aiProvider: 'gemini' as const }
     const intent = classifyIntent('Design a distributed cache system with raft consensus', [])
     const selection = selectModelForTask('reasoning', cfg, intent)
     assert.strictEqual(selection.provider, 'gemini')
-    assert(selection.modelName.includes('pro'), 'Must select a Gemini Pro reasoning model')
+    assert.strictEqual(selection.modelName, DEFAULT_GEMINI_CHAT_MODEL)
   })
 
   // TEST 8: Greetings do not trigger unnecessary web searches
@@ -284,7 +292,7 @@ async function main() {
     assert(netlifyToml.includes('from = "/*"'), 'Must have SPA fallback redirect')
   })
 
-  // TEST 18: Deprecated/Unsupported model produces clear actionable guidance pointing to gemini-2.5-flash
+  // TEST 18: Deprecated/Unsupported model produces guidance for the current safe default
   await runTest('Test 18: Deprecated/unsupported model error produces actionable configuration guidance', () => {
     const modelError = {
       status: 404,
@@ -292,8 +300,8 @@ async function main() {
     }
     const classified = classifyGeminiError(modelError)
     assert(
-      classified.message.includes('gemini-2.5-flash'),
-      `Expected guidance recommending gemini-2.5-flash, got: "${classified.message}"`
+      classified.message.includes(DEFAULT_GEMINI_CHAT_MODEL),
+      `Expected guidance recommending ${DEFAULT_GEMINI_CHAT_MODEL}, got: "${classified.message}"`
     )
     assert(
       !classified.message.includes('gemini-1.5-flash'),
@@ -335,16 +343,82 @@ async function main() {
   await runTest('Test 21: Dynamic model discovery returns available models', async () => {
     const models = await getSupportedGeminiModels('test-mock-key')
     assert(Array.isArray(models) && models.length > 0, 'Must return array of models')
-    assert(models.includes('gemini-2.5-flash'), 'Must include modern gemini-2.5-flash')
+    assert(models.includes(DEFAULT_GEMINI_CHAT_MODEL), 'Must include the configured default conversational model')
+    assert(
+      !models.includes('gemini-2.5-flash-preview-tts'),
+      'TTS models must not be exposed as chat-capable candidates'
+    )
   })
 
-  // TEST 22: Fast Mode defaults to modern Flash model
-  await runTest('Test 22: Fast Mode defaults to gemini-2.5-flash when unset', () => {
+  // TEST 22: Fast Mode defaults to configured conversational model
+  await runTest('Test 22: Fast Mode defaults to gemini-3.8-flash when unset', () => {
     const cfg = { ...configService.getConfig(), aiProvider: 'gemini' as const, modelName: '' }
     const intent = classifyIntent('What is today?', [])
     const selection = selectModelForTask('fast', cfg, intent)
     assert.strictEqual(selection.provider, 'gemini')
-    assert(selection.modelName.includes('flash'), 'Default model must be a Flash model')
+    assert.strictEqual(selection.modelName, DEFAULT_GEMINI_CHAT_MODEL)
+  })
+
+  await runTest('GEMINI_MODEL overrides saved model names but specialized models are rejected', async () => {
+    const previousModel = process.env.GEMINI_MODEL
+    try {
+      process.env.GEMINI_MODEL = 'gemini-3.8-flash'
+      const cfg = {
+        ...configService.getConfig(),
+        aiProvider: 'gemini' as const,
+        modelName: 'gemini-2.5-flash-preview-tts',
+      }
+      const intent = classifyIntent('Hi', [])
+      assert.strictEqual(selectModelForTask('fast', cfg, intent).modelName, 'gemini-3.8-flash')
+      assert.strictEqual(resolveGeminiChatModel('gemini-2.5-flash-preview-tts'), 'gemini-3.8-flash')
+      process.env.GEMINI_MODEL = ''
+      await assert.rejects(
+        generateGeminiStream(
+          'test-mock-key',
+          'gemini-2.5-flash-preview-tts',
+          '',
+          'Hello',
+          []
+        ),
+        /conversational text model/
+      )
+    } finally {
+      if (previousModel === undefined) delete process.env.GEMINI_MODEL
+      else process.env.GEMINI_MODEL = previousModel
+    }
+  })
+
+  await runTest('Specialized Gemini configuration does not affect primary Ollama routing', () => {
+    const previousModel = process.env.GEMINI_MODEL
+    try {
+      process.env.GEMINI_MODEL = 'gemini-2.5-flash-preview-tts'
+      const cfg = {
+        ...configService.getConfig(),
+        aiProvider: 'ollama' as const,
+        ollamaModel: 'qwen2.5:3b',
+        modelName: 'qwen2.5:3b',
+      }
+      const intent = classifyIntent('Hi', [])
+      assert.strictEqual(selectModelForTask('fast', cfg, intent).provider, 'ollama')
+      assert.strictEqual(selectModelForTask('fast', cfg, intent).modelName, 'qwen2.5:3b')
+    } finally {
+      if (previousModel === undefined) delete process.env.GEMINI_MODEL
+      else process.env.GEMINI_MODEL = previousModel
+    }
+  })
+
+  await runTest('Gemini multi-turn history is normalized for chat sessions', () => {
+    const history = normalizeGeminiChatHistory([
+      { role: 'assistant', content: 'orphan assistant message' },
+      { role: 'user', content: 'Earlier question' },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Follow-up question' },
+    ])
+    assert.deepStrictEqual(history, [
+      { role: 'user', parts: [{ text: 'Earlier question' }] },
+      { role: 'model', parts: [{ text: 'Earlier answer' }] },
+      { role: 'user', parts: [{ text: 'Follow-up question' }] },
+    ])
   })
 
   console.log(`\n=== PRODUCTION AUDIT TEST RESULTS: ${passedCount} PASSED, ${failedCount} FAILED ===\n`)

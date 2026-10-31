@@ -1,4 +1,5 @@
 import { AppConfig, IntentClassification } from '../types.js'
+import { resolveGeminiChatModel } from './geminiModel.js'
 
 export type TaskTier = 'fast' | 'reasoning' | 'media'
 
@@ -91,7 +92,7 @@ export function selectModelForTask(
         ? process.env.DEFAULT_AI_PROVIDER!.trim() as ModelSelection['provider']
         : 'ollama'
   const isGeminiModel = Boolean(config.modelName?.trim().toLowerCase().includes('gemini'))
-  const flashModel = (isGeminiModel ? config.modelName?.trim() : null) || process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+  const geminiChatModel = () => resolveGeminiChatModel(isGeminiModel ? config.modelName : undefined)
   const ollamaModel = config.ollamaModel?.trim() || (!isGeminiModel ? config.modelName?.trim() : null) || process.env.OLLAMA_MODEL || 'qwen2.5:3b'
 
   // 1. FAST TIER: Optimize for sub-second TTFT and low latency
@@ -111,7 +112,7 @@ export function selectModelForTask(
       return {
         tier: 'fast',
         provider: 'gemini',
-        modelName: flashModel,
+        modelName: geminiChatModel(),
         reason: 'Fast Gemini Flash model selected for low latency and high conversational accuracy.',
       }
     }
@@ -155,13 +156,12 @@ export function selectModelForTask(
     }
   }
 
-  const proModel = process.env.GEMINI_PRO_MODEL || 'gemini-2.5-pro'
   if (configuredProvider === 'gemini') {
     return {
       tier: 'reasoning',
       provider: 'gemini',
-      modelName: proModel,
-      reason: 'Gemini Pro selected for deep multi-step reasoning and technical accuracy.',
+      modelName: geminiChatModel(),
+      reason: 'Configured Gemini conversational model selected for reasoning.',
     }
   }
 

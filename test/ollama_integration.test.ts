@@ -320,6 +320,7 @@ async function main() {
       AI_FALLBACK_PROVIDER: process.env.AI_FALLBACK_PROVIDER,
       OLLAMA_CONNECTION_TIMEOUT_MS: process.env.OLLAMA_CONNECTION_TIMEOUT_MS,
       GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+      GEMINI_MODEL: process.env.GEMINI_MODEL,
     }
     const originalFetch = globalThis.fetch
     process.env.NODE_ENV = 'production'
@@ -328,6 +329,7 @@ async function main() {
     process.env.AI_FALLBACK_PROVIDER = 'gemini'
     process.env.OLLAMA_CONNECTION_TIMEOUT_MS = '50'
     process.env.GEMINI_API_KEY = apiKey
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash'
     globalThis.fetch = fetchImplementation
     try {
       await action()
@@ -388,6 +390,8 @@ async function main() {
         },
       })
       assert(response.includes('verified test response from Gemini'))
+      assert(response.includes('gemini-3.8-flash'))
+      assert(response.includes('2 prior chat message(s)'))
       assert.strictEqual(fallbackCount, 1)
       assert.strictEqual(requestCount, 1)
       assert(tokens.join(''), response)
@@ -495,7 +499,7 @@ async function main() {
         }
       )
       assert.strictEqual(done.provider, 'gemini')
-      assert.strictEqual(done.model, 'gemini-2.5-flash')
+      assert.strictEqual(done.model, 'gemini-3.8-flash')
       assert.strictEqual(fallbackEvents, 1)
       assert(tokens.length > 0)
       assert(tokens.join(''), done.content)

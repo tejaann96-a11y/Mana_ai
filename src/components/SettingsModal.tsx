@@ -1271,7 +1271,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="settings-card">
                 <span className="settings-card-title">Model Identifier</span>
                 <span className="settings-card-desc">
-                  Specify the model variant (e.g. <code>gemini-2.5-flash</code>).
+                  Specify the model variant (e.g. <code>gemini-3.8-flash</code>).
                 </span>
                 <input
                   type="text"
@@ -1280,7 +1280,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   onChange={(e) => handleTextChange('modelName', e.target.value)}
                   placeholder={
                     formData.aiProvider === 'gemini'
-                      ? 'gemini-2.5-flash'
+                      ? 'gemini-3.8-flash'
                       : formData.aiProvider === 'openai'
                       ? 'gpt-4o-mini'
                       : 'llama-3.1-8b-instant'

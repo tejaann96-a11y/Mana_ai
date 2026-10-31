@@ -7,6 +7,11 @@ import { determineTaskTier, selectModelForTask } from './modelRouter.js'
 import { optimizeConversationContext } from './contextManager.js'
 import { classifyIntent, isExplicitEnglishLevelRequest } from './intentClassifier.js'
 import { buildLocalDateTimeContext } from './dateTimeService.js'
+import {
+  DEFAULT_GEMINI_CHAT_MODEL,
+  isGeminiChatModel,
+  resolveGeminiChatModel,
+} from './geminiModel.js'
 
 const geminiClientCache = new Map<string, GoogleGenerativeAI>()
 const openAIClientCache = new Map<string, OpenAI>()
@@ -253,7 +258,7 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
         )
       }
 
-      const geminiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
+      const geminiModel = resolveGeminiChatModel()
       const fallbackMessage = `Ollama is unavailable; using configured Gemini fallback (${geminiModel}).`
       console.warn('[AIService] Ollama is unavailable; attempting configured Gemini fallback.')
       options.onProviderFallback?.({ from: 'ollama', to: 'gemini', message: fallbackMessage })
@@ -286,7 +291,7 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
     if (!activeGeminiKey) {
       throw new Error('Google Gemini API key is missing. Please set the GEMINI_API_KEY environment variable on your server or configure your key in Settings.')
     }
-    const geminiModel = modelSelection.modelName || process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+    const geminiModel = resolveGeminiChatModel(modelSelection.modelName)
     const content = await generateGeminiStream(
       activeGeminiKey,
       geminiModel,
@@ -724,7 +729,14 @@ const CACHE_TTL_MS = 15 * 60 * 1000 // 15 minutes cache
 export async function getSupportedGeminiModels(apiKey: string, signal?: AbortSignal): Promise<string[]> {
   if (!apiKey || typeof apiKey !== 'string' || apiKey.length < 10) return []
   if (apiKey === 'test-mock-key') {
-    return ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-pro']
+    return [
+      DEFAULT_GEMINI_CHAT_MODEL,
+      'gemini-2.5-flash',
+      'gemini-2.5-flash-preview-tts',
+      'gemini-2.0-flash',
+      'gemini-1.5-flash',
+      'gemini-2.5-pro',
+    ].filter(isGeminiChatModel)
   }
 
   const cached = modelListCache.get(apiKey)
@@ -765,7 +777,7 @@ export async function getSupportedGeminiModels(apiKey: string, signal?: AbortSig
       if (status === 429 || msg.includes('quota') || msg.includes('resource_exhausted')) {
         throw classifyGeminiError({ status: 429, message: errData?.error?.message || 'Quota exceeded' })
       }
-      console.warn(`[AIService] Failed to list models from Gemini API (${res.status}): ${errData?.error?.message || res.statusText}`)
+      console.warn(`[AIService] Gemini model discovery failed with HTTP ${res.status}.`)
       return []
     }
 
@@ -778,11 +790,11 @@ export async function getSupportedGeminiModels(apiKey: string, signal?: AbortSig
             m.supportedGenerationMethods.includes('generateContent')
         )
         .map((m: any) => (m.name || '').replace(/^models\//, '').trim())
-        .filter(Boolean)
+        .filter((modelName: string) => Boolean(modelName) && isGeminiChatModel(modelName))
 
       if (validModels.length > 0) {
         modelListCache.set(apiKey, { models: validModels, fetchedAt: Date.now() })
-        console.log(`[AIService] Discovered ${validModels.length} active Gemini models supporting generateContent`)
+        console.log(`[AIService] Discovered ${validModels.length} conversational Gemini models`)
         return validModels
       }
     }
@@ -797,7 +809,7 @@ export async function getSupportedGeminiModels(apiKey: string, signal?: AbortSig
     ) {
       throw err
     }
-    console.warn(`[AIService] Dynamic model query error: ${err.message}`)
+    console.warn('[AIService] Gemini model discovery unavailable; continuing with configured chat model.')
   }
 
   return []
@@ -862,7 +874,7 @@ export function classifyGeminiError(err: any): Error {
     lowerMsg.includes('deprecated')
   ) {
     return new Error(
-      'The requested Gemini model is not supported or has been deprecated. Please configure GEMINI_MODEL=gemini-2.5-flash in your Netlify environment variables.'
+      `The requested Gemini model is not supported or has been deprecated. Please configure GEMINI_MODEL=${DEFAULT_GEMINI_CHAT_MODEL} in your server environment.`
     )
   }
 
@@ -890,6 +902,28 @@ export function classifyGeminiError(err: any): Error {
   return new Error(`Gemini Error: ${sanitizedMsg || 'Unknown error occurred while contacting Gemini'}`)
 }
 
+export function normalizeGeminiChatHistory(
+  history: Array<{ role: 'user' | 'assistant'; content: string }>
+): Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> {
+  const validHistory = (history || [])
+    .filter((msg) => msg && typeof msg.content === 'string' && msg.content.trim())
+    .slice(-16)
+  const chatHistory: Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> = []
+
+  for (const msg of validHistory) {
+    const role: 'user' | 'model' = msg.role === 'assistant' ? 'model' : 'user'
+    if (chatHistory.length === 0 && role === 'model') continue
+    const previousMessage = chatHistory[chatHistory.length - 1]
+    if (previousMessage?.role === role) {
+      previousMessage.parts[0].text += `\n\n${msg.content}`
+    } else {
+      chatHistory.push({ role, parts: [{ text: msg.content }] })
+    }
+  }
+
+  return chatHistory
+}
+
 /**
  * Streams response using Google Gemini with dynamic model discovery,
  * multi-turn history, model fallback, bounded retries, and clean error handling.
@@ -903,9 +937,15 @@ export async function generateGeminiStream(
   onToken?: (token: string) => void,
   signal?: AbortSignal
 ): Promise<string> {
+  const cleanRequestedModel = resolveGeminiChatModel(modelName)
+  const chatHistory = normalizeGeminiChatHistory(history)
+
   // Support safe offline test mock without consuming real API quota
   if (apiKey === 'test-mock-key') {
-    const mockReply = `Hello mama! This is a verified test response from Gemini Flash (${modelName}).`
+    const historyContext = chatHistory.length
+      ? ` with ${chatHistory.length} prior chat message(s)`
+      : ''
+    const mockReply = `Hello mama! This is a verified test response from Gemini Flash (${cleanRequestedModel})${historyContext}.`
     const words = mockReply.split(' ')
     for (let i = 0; i < words.length; i++) {
       const chunk = (i === 0 ? '' : ' ') + words[i]
@@ -913,10 +953,6 @@ export async function generateGeminiStream(
     }
     return mockReply
   }
-
-  const cleanRequestedModel = (modelName || process.env.GEMINI_MODEL || 'gemini-2.5-flash')
-    .replace(/^models\//, '')
-    .trim()
 
   // 1. Dynamically query available models supporting generateContent for this API key
   let availableModels: string[] = []
@@ -933,7 +969,7 @@ export async function generateGeminiStream(
     ) {
       throw err
     }
-    console.warn(`[AIService] Dynamic model query error: ${err.message}`)
+    console.warn('[AIService] Gemini model discovery unavailable; continuing with configured chat model.')
   }
 
   // 2. Build prioritized candidate models list:
@@ -947,13 +983,13 @@ export async function generateGeminiStream(
   // (b) Add any active Flash models discovered from the API key
   if (availableModels.length > 0) {
     const flashModels = availableModels.filter(
-      (m) => (m.includes('flash') || m.includes('lite')) && m !== cleanRequestedModel
+      (m) => isGeminiChatModel(m) && (m.includes('flash') || m.includes('lite')) && m !== cleanRequestedModel
     )
     candidateModels.push(...flashModels)
 
     // Add Pro models as secondary reasoning backups
     const proModels = availableModels.filter(
-      (m) => m.includes('pro') && m !== cleanRequestedModel && !candidateModels.includes(m)
+      (m) => isGeminiChatModel(m) && m.includes('pro') && m !== cleanRequestedModel && !candidateModels.includes(m)
     )
     candidateModels.push(...proModels)
   }
@@ -961,6 +997,7 @@ export async function generateGeminiStream(
   // (c) Add default modern candidate fallbacks in priority order
   const defaultFallbacks = [
     cleanRequestedModel,
+    DEFAULT_GEMINI_CHAT_MODEL,
     'gemini-2.5-flash',
     'gemini-2.0-flash',
     'gemini-1.5-flash',
@@ -974,30 +1011,6 @@ export async function generateGeminiStream(
   }
 
   const genAI = getGeminiClient(apiKey)
-
-  // Sanitize chat history for Gemini:
-  // 1. Filter out empty contents
-  // 2. Ensure roles strictly alternate: user, model, user, model
-  // 3. Ensure first message starts with 'user'
-  const validHistory = (history || [])
-    .filter((msg) => msg && typeof msg.content === 'string' && msg.content.trim())
-    .slice(-16)
-
-  const chatHistory: Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> = []
-  for (const msg of validHistory) {
-    const role: 'user' | 'model' = msg.role === 'assistant' ? 'model' : 'user'
-    if (chatHistory.length === 0 && role === 'model') {
-      continue
-    }
-    if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === role) {
-      chatHistory[chatHistory.length - 1].parts[0].text += `\n\n${msg.content}`
-    } else {
-      chatHistory.push({
-        role,
-        parts: [{ text: msg.content }],
-      })
-    }
-  }
 
   let lastError: any = null
   for (const candidate of candidateModels) {
