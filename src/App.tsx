@@ -1271,6 +1271,12 @@ export const App: React.FC = () => {
                 flushAssistantState(false)
                 break
 
+              case 'provider_fallback':
+                currentAssistantState.isSearching = true
+                currentAssistantState.searchStatus = parsed.message
+                flushAssistantState(false)
+                break
+
               case 'search_results':
                 currentAssistantState.searchEvidence = parsed
                 finalEvidence = parsed

@@ -308,6 +308,204 @@ async function main() {
     }
   })
 
+  const withFallbackEnvironment = async (
+    fetchImplementation: typeof fetch,
+    action: () => Promise<void>,
+    apiKey = 'test-mock-key'
+  ) => {
+    const previous: Record<string, string | undefined> = {
+      NODE_ENV: process.env.NODE_ENV,
+      AI_PROVIDER: process.env.AI_PROVIDER,
+      AI_FALLBACK_ENABLED: process.env.AI_FALLBACK_ENABLED,
+      AI_FALLBACK_PROVIDER: process.env.AI_FALLBACK_PROVIDER,
+      OLLAMA_CONNECTION_TIMEOUT_MS: process.env.OLLAMA_CONNECTION_TIMEOUT_MS,
+      GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+    }
+    const originalFetch = globalThis.fetch
+    process.env.NODE_ENV = 'production'
+    process.env.AI_PROVIDER = 'ollama'
+    process.env.AI_FALLBACK_ENABLED = 'true'
+    process.env.AI_FALLBACK_PROVIDER = 'gemini'
+    process.env.OLLAMA_CONNECTION_TIMEOUT_MS = '50'
+    process.env.GEMINI_API_KEY = apiKey
+    globalThis.fetch = fetchImplementation
+    try {
+      await action()
+    } finally {
+      for (const [name, value] of Object.entries(previous)) restoreEnv(name, value)
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  const makeGenerationOptions = () => ({
+    prompt: 'Explain a simple greeting.',
+    history: [
+      { role: 'user' as const, content: 'What did I ask earlier?' },
+      { role: 'assistant' as const, content: 'You asked about Hyderabad.' },
+    ],
+    config: {
+      ...configService.getConfig(),
+      aiProvider: 'ollama' as const,
+      ollamaBaseUrl: 'http://127.0.0.1:59998',
+      ollamaModel: 'qwen2.5:3b',
+      modelName: 'qwen2.5:3b',
+    },
+  })
+
+  await runTest('Ollama success does not call Gemini', async () => {
+    let geminiCalled = false
+    await withFallbackEnvironment(async (input, init) => {
+      const url = String(input)
+      if (url.startsWith('https://generativelanguage.googleapis.com/')) geminiCalled = true
+      assert(url.startsWith('http://127.0.0.1:59998/api/chat'))
+      assert.strictEqual(JSON.parse(String(init?.body)).model, 'qwen2.5:3b')
+      return new Response('{"message":{"content":"Ollama answer"},"done":true}\n', {
+        status: 200,
+        headers: { 'Content-Type': 'application/x-ndjson' },
+      })
+    }, async () => {
+      const response = await generateAIResponse(makeGenerationOptions())
+      assert.strictEqual(response, 'Ollama answer')
+      assert.strictEqual(geminiCalled, false)
+    })
+  })
+
+  await runTest('Ollama offline streams one Gemini fallback response with history', async () => {
+    let requestCount = 0
+    const tokens: string[] = []
+    let fallbackCount = 0
+    await withFallbackEnvironment(async () => {
+      requestCount++
+      throw new TypeError('fetch failed')
+    }, async () => {
+      const response = await generateAIResponse({
+        ...makeGenerationOptions(),
+        onToken: (token) => tokens.push(token),
+        onProviderFallback: ({ from, to }) => {
+          assert.strictEqual(from, 'ollama')
+          assert.strictEqual(to, 'gemini')
+          fallbackCount++
+        },
+      })
+      assert(response.includes('verified test response from Gemini'))
+      assert.strictEqual(fallbackCount, 1)
+      assert.strictEqual(requestCount, 1)
+      assert(tokens.join(''), response)
+      assert.strictEqual(tokens.filter((token) => token.includes('Ollama')).length, 0)
+    })
+  })
+
+  await runTest('Ollama connection timeout triggers Gemini fallback', async () => {
+    await withFallbackEnvironment(async (_input, init) => {
+      const signal = init?.signal
+      return await new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    }, async () => {
+      const response = await generateAIResponse(makeGenerationOptions())
+      assert(response.includes('verified test response from Gemini'))
+    })
+  })
+
+  await runTest('Private file requests never use Gemini fallback', async () => {
+    await withFallbackEnvironment(async () => {
+      throw new TypeError('fetch failed')
+    }, async () => {
+      await assert.rejects(
+        generateAIResponse({
+          ...makeGenerationOptions(),
+          allowProviderFallback: false,
+          documentMatches: [{
+            docTitle: 'private.txt',
+            score: 1,
+            chunk: {
+              id: 'private-chunk',
+              docId: 'private-document',
+              docTitle: 'private.txt',
+              chunkIndex: 0,
+              text: 'private document contents',
+              tokensApprox: 4,
+            },
+          }],
+        }),
+        /Gemini fallback is disabled for requests containing private files or images/
+      )
+    })
+  })
+
+  await runTest('Missing Gemini fallback key returns an actionable error', async () => {
+    await withFallbackEnvironment(async () => {
+      throw new TypeError('fetch failed')
+    }, async () => {
+      await assert.rejects(
+        generateAIResponse(makeGenerationOptions()),
+        /Gemini fallback is enabled, but GEMINI_API_KEY is missing or invalid/
+      )
+    }, '')
+  })
+
+  await runTest('Gemini fallback failures are returned clearly', async () => {
+    await withFallbackEnvironment(async (input) => {
+      if (String(input).startsWith('http://127.0.0.1:59998')) {
+        throw new TypeError('fetch failed')
+      }
+      throw new TypeError('Gemini service unavailable')
+    }, async () => {
+      await assert.rejects(
+        generateAIResponse(makeGenerationOptions()),
+        /Ollama is unavailable and Gemini fallback failed/
+      )
+    }, 'valid-test-gemini-key')
+  })
+
+  await runTest('Ollama authentication failure does not trigger Gemini fallback', async () => {
+    let requestCount = 0
+    await withFallbackEnvironment(async () => {
+      requestCount++
+      return new Response('{"error":"unauthorized"}', { status: 401 })
+    }, async () => {
+      await assert.rejects(generateAIResponse(makeGenerationOptions()), /Ollama Error \(401\)/)
+      assert.strictEqual(requestCount, 1)
+    })
+  })
+
+  await runTest('Orchestrator reports Gemini as handler without duplicating chat history or tokens', async () => {
+    const tokens: string[] = []
+    let done: any
+    let fallbackEvents = 0
+    const history = [
+      { role: 'user' as const, content: 'Earlier question' },
+      { role: 'assistant' as const, content: 'Earlier answer' },
+    ]
+    await withFallbackEnvironment(async () => {
+      throw new TypeError('fetch failed')
+    }, async () => {
+      await orchestrateChat(
+        {
+          ...makeGenerationOptions(),
+          history,
+          searchMode: 'never',
+        },
+        {
+          onToken: (token) => tokens.push(token),
+          onProviderFallback: () => fallbackEvents++,
+          onDone: (data) => {
+            done = data
+          },
+        }
+      )
+      assert.strictEqual(done.provider, 'gemini')
+      assert.strictEqual(done.model, 'gemini-2.5-flash')
+      assert.strictEqual(fallbackEvents, 1)
+      assert(tokens.length > 0)
+      assert(tokens.join(''), done.content)
+      assert.deepStrictEqual(history, [
+        { role: 'user', content: 'Earlier question' },
+        { role: 'assistant', content: 'Earlier answer' },
+      ])
+    })
+  })
+
   // TEST 8: AI_API_BASE_URL is supported for production cloud backend configuration
   await runTest('Test 8: AI_API_BASE_URL is recognized in orchestrator and config', async () => {
     const prevUrl = process.env.AI_API_BASE_URL
@@ -410,7 +608,10 @@ async function main() {
 
     assert(caughtError !== null, 'Should throw error when remote cloud host is unreachable')
     assert(
-      caughtError.message.includes('cloud AI backend') || caughtError.message.includes('AI_API_BASE_URL') || caughtError.message.includes('Failed to connect'),
+      caughtError.message.includes('cloud AI backend') ||
+        caughtError.message.includes('configured Ollama gateway') ||
+        caughtError.message.includes('AI_API_BASE_URL') ||
+        caughtError.message.includes('Failed to connect'),
       `Expected cloud-specific error, got: ${caughtError.message}`
     )
   })

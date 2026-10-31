@@ -34,6 +34,7 @@ export interface StreamEventCallbacks {
   onSearchStatus?: (data: { status: string; step: string }) => void
   onSearchResults?: (evidence: SearchEvidence) => void
   onImageSearchResults?: (evidence: ImageSearchEvidence) => void
+  onProviderFallback?: (data: { from: 'ollama'; to: 'gemini'; message: string }) => void
   onToken?: (token: string) => void
   onDone?: (data: any) => void
   onError?: (error: Error) => void
@@ -417,6 +418,10 @@ export async function orchestrateChat(
 
   let firstTokenTime: number | null = null
   let accumulatedContent = ''
+  let handledProvider = config.aiProvider || 'ollama'
+  let handledModel = config.aiProvider === 'ollama'
+    ? config.ollamaModel || config.modelName || 'qwen2.5:3b'
+    : config.modelName || config.ollamaModel || 'qwen2.5:3b'
 
   const onTokenHandler = (token: string) => {
     if (!firstTokenTime) {
@@ -439,8 +444,14 @@ export async function orchestrateChat(
     reasoningMode,
     documentMatches,
     images: visionImages.map((image) => image.data),
+    allowProviderFallback: sessionFiles.length === 0 && visionImages.length === 0,
     signal,
     onToken: onTokenHandler,
+    onProviderFallback: (data) => callbacks?.onProviderFallback?.(data),
+    onProviderUsed: (provider, modelName) => {
+      handledProvider = provider as typeof handledProvider
+      handledModel = modelName
+    },
   })
 
   if (signal?.aborted) {
@@ -456,10 +467,8 @@ export async function orchestrateChat(
     memoriesUsed: relevantMemories.map((m) => m.key),
     documentsUsed: documentMatches.map((d) => d.docTitle),
     reasoningMode,
-    provider: config.aiProvider || 'ollama',
-    model: config.aiProvider === 'ollama'
-      ? config.ollamaModel || config.modelName || 'qwen2.5:3b'
-      : config.modelName || config.ollamaModel || 'qwen2.5:3b',
+    provider: handledProvider,
+    model: handledModel,
     timings: {
       reqStart,
       ttftMs: firstTokenTime || totalTime,

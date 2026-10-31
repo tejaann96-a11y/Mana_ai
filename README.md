@@ -68,7 +68,9 @@ Open: **http://localhost:5173**
 
 ### Hosted Ollama
 
-The default provider is Ollama with `qwen2.5:3b` at `http://127.0.0.1:11434` for local development. For a hosted Mana AI deployment, configure `AI_API_BASE_URL` (or `OLLAMA_BASE_URL`) to an HTTPS authenticated gateway and set `OLLAMA_API_KEY` in the server environment. The browser never receives this key. Do not expose Ollama's port 11434 directly; an unavailable Ollama endpoint returns an error rather than switching providers. Gemini remains available only when selected.
+The default and primary provider is Ollama with `qwen2.5:3b` at `http://127.0.0.1:11434` for local development; no tunnel is needed locally. Optional hybrid fallback is controlled on the server with `AI_FALLBACK_ENABLED=true`, `AI_FALLBACK_PROVIDER=gemini`, `GEMINI_API_KEY`, and `GEMINI_MODEL`. Ollama connection failures, gateway availability errors, and timeouts may use Gemini only when enabled and a valid key is configured; authentication, invalid-request, and rate-limit errors do not trigger fallback. `OLLAMA_CONNECTION_TIMEOUT_MS` controls the Ollama request timeout (default: 8000 ms). Fallback handles a request without changing the saved provider selection, and status events identify when Gemini handled it.
+
+For a hosted Mana AI deployment, configure `AI_API_BASE_URL` (or `OLLAMA_BASE_URL`) to the owner's HTTPS authenticated Ollama gateway and set `OLLAMA_API_KEY` in the server environment. The browser never receives this key. Never expose Ollama's port 11434 directly. If Ollama and enabled Gemini fallback are both unavailable, Mana AI returns a clear error.
 
 ---
 

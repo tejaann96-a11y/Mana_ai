@@ -52,13 +52,31 @@ export const handler = stream(async (event, _context) => {
 
   const passThrough = new PassThrough()
   const requestController = new AbortController()
+  let startOutput!: () => void
+  const outputReady = new Promise<void>((resolve) => {
+    startOutput = resolve
+  })
   passThrough.on('close', () => {
     if (!passThrough.writableEnded) requestController.abort()
+    startOutput()
   })
 
+  let outputStarted = false
+  const pendingEvents: string[] = []
   const sendEvent = (eventType: string, data: any) => {
     if (requestController.signal.aborted || passThrough.destroyed) return
-    passThrough.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`)
+    const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`
+    if (!outputStarted && eventType !== 'token' && eventType !== 'error' && eventType !== 'done') {
+      pendingEvents.push(payload)
+      return
+    }
+    if (!outputStarted) {
+      outputStarted = true
+      startOutput()
+      for (const queuedEvent of pendingEvents) passThrough.write(queuedEvent)
+      pendingEvents.length = 0
+    }
+    passThrough.write(payload)
   }
 
     ; (async () => {
@@ -85,6 +103,7 @@ export const handler = stream(async (event, _context) => {
             onSearchStatus: (data) => sendEvent('search_status', data),
             onSearchResults: (evidence) => sendEvent('search_results', evidence),
             onImageSearchResults: (evidence) => sendEvent('image_search_results', evidence),
+            onProviderFallback: (data) => sendEvent('provider_fallback', data),
             onToken: (token) => sendEvent('token', { token }),
             onDone: (data) => {
               sendEvent('done', data)
@@ -100,6 +119,8 @@ export const handler = stream(async (event, _context) => {
         passThrough.end()
       }
     })()
+
+  await outputReady
 
   return {
     statusCode: 200,

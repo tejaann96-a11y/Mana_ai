@@ -680,19 +680,32 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform')
   res.setHeader('Connection', 'keep-alive')
   res.setHeader('X-Accel-Buffering', 'no')
-  res.flushHeaders?.()
-
   const requestController = new AbortController()
   res.on('close', () => {
     if (!res.writableEnded) requestController.abort()
   })
 
-  const sendEvent = (event: string, data: any) => {
-    if (requestController.signal.aborted || res.writableEnded || res.destroyed) return
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  let outputStarted = false
+  const pendingEvents: string[] = []
+  const writeEvent = (payload: string) => {
+    res.write(payload)
     if (typeof (res as any).flush === 'function') {
       ;(res as any).flush()
     }
+  }
+  const sendEvent = (event: string, data: any) => {
+    if (requestController.signal.aborted || res.writableEnded || res.destroyed) return
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    if (!outputStarted && event !== 'token' && event !== 'error' && event !== 'done') {
+      pendingEvents.push(payload)
+      return
+    }
+    if (!outputStarted) {
+      outputStarted = true
+      for (const queuedEvent of pendingEvents) writeEvent(queuedEvent)
+      pendingEvents.length = 0
+    }
+    writeEvent(payload)
   }
 
   const authUser = getAuthUser(req)
@@ -722,6 +735,7 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
         onSearchStatus: (data) => sendEvent('search_status', data),
         onSearchResults: (evidence) => sendEvent('search_results', evidence),
         onImageSearchResults: (evidence) => sendEvent('image_search_results', evidence),
+        onProviderFallback: (data) => sendEvent('provider_fallback', data),
         onToken: (token) => sendEvent('token', { token }),
         onDone: (data) => {
           sendEvent('done', data)

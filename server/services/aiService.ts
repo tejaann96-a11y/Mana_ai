@@ -46,9 +46,35 @@ export interface GenerationOptions {
   documentMatches?: DocumentSearchResult[]
   toolResults?: ToolResult[]
   images?: string[]
+  allowProviderFallback?: boolean
   signal?: AbortSignal
   onToken?: (token: string) => void
   onStatus?: (status: string) => void
+  onProviderFallback?: (data: { from: 'ollama'; to: 'gemini'; message: string }) => void
+  onProviderUsed?: (provider: string, modelName: string) => void
+}
+
+export class OllamaAvailabilityError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'OllamaAvailabilityError'
+  }
+}
+
+export function getOllamaConnectionTimeoutMs(): number {
+  const configuredTimeout = Number.parseInt(process.env.OLLAMA_CONNECTION_TIMEOUT_MS || '', 10)
+  return Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? Math.min(configuredTimeout, 120_000)
+    : 8_000
+}
+
+function isAvailabilityFailure(err: unknown): err is OllamaAvailabilityError {
+  return err instanceof OllamaAvailabilityError
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  return String(err)
 }
 
 /**
@@ -109,6 +135,11 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
   const intent = classifyIntent(prompt, effectiveHistory)
   const taskTier = determineTaskTier(prompt, intent, reasoningMode)
   const modelSelection = selectModelForTask(taskTier, config, intent)
+  const isGenuineKey = (key?: string): boolean =>
+    typeof key === 'string' && key.trim().length > 10 && !key.includes('••••') && !key.includes('****')
+  const activeGeminiKey = isGenuineKey(config.geminiApiKey)
+    ? config.geminiApiKey!.trim()
+    : (isGenuineKey(process.env.GEMINI_API_KEY) ? process.env.GEMINI_API_KEY!.trim() : '')
 
   // Language Persistence: check explicit user instruction, memory preference, or conversational history
   const langMem = optimized.memoriesUsed.find((m) => m.key.toLowerCase().includes('language'))
@@ -177,49 +208,107 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
     )
     const finalOllamaSystemPrompt = `${resolvedRefsPrefix}${ollamaSystemPrompt}\n\n${dateTimeContext}`
 
-    return await generateOllamaStream(
-      ollamaBaseUrl,
-      ollamaModel,
-      finalOllamaSystemPrompt,
-      fullPromptWithEvidence,
-      effectiveHistory,
-      onToken,
-      isDetailRequested,
-      signal,
-      images
-    )
+    let ollamaEmittedContent = false
+    try {
+      const content = await generateOllamaStream(
+        ollamaBaseUrl,
+        ollamaModel,
+        finalOllamaSystemPrompt,
+        fullPromptWithEvidence,
+        effectiveHistory,
+        (token) => {
+          ollamaEmittedContent = true
+          onToken?.(token)
+        },
+        isDetailRequested,
+        signal,
+        images
+      )
+      options.onProviderUsed?.('ollama', ollamaModel)
+      console.info(`[AIService] Request handled by provider=ollama model=${ollamaModel}.`)
+      return content
+    } catch (err) {
+      if (signal?.aborted) {
+        throw signal.reason || err
+      }
+      if (!isAvailabilityFailure(err) || ollamaEmittedContent) {
+        throw err
+      }
+
+      const fallbackEnabled =
+        process.env.AI_FALLBACK_ENABLED?.trim().toLowerCase() === 'true'
+      const fallbackProvider = process.env.AI_FALLBACK_PROVIDER?.trim().toLowerCase()
+      if (!fallbackEnabled || fallbackProvider !== 'gemini' || options.allowProviderFallback === false || images.length > 0) {
+        if (options.allowProviderFallback === false || images.length > 0) {
+          throw new Error(
+            `Ollama is unavailable. Gemini fallback is disabled for requests containing private files or images. ${err.message}`
+          )
+        }
+        console.warn('[AIService] Ollama is unavailable; automatic fallback is disabled.')
+        throw err
+      }
+      if (!activeGeminiKey) {
+        throw new Error(
+          `Ollama is unavailable. Gemini fallback is enabled, but GEMINI_API_KEY is missing or invalid. ${err.message}`
+        )
+      }
+
+      const geminiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
+      const fallbackMessage = `Ollama is unavailable; using configured Gemini fallback (${geminiModel}).`
+      console.warn('[AIService] Ollama is unavailable; attempting configured Gemini fallback.')
+      options.onProviderFallback?.({ from: 'ollama', to: 'gemini', message: fallbackMessage })
+      try {
+        const content = await generateGeminiStream(
+          activeGeminiKey,
+          geminiModel,
+          finalSystemPrompt,
+          fullPromptWithEvidence,
+          effectiveHistory,
+          onToken,
+          signal
+        )
+        options.onProviderUsed?.('gemini', geminiModel)
+        console.info(`[AIService] Request handled by provider=gemini model=${geminiModel} (fallback).`)
+        return content
+      } catch (fallbackError) {
+        if (signal?.aborted) {
+          throw signal.reason || fallbackError
+        }
+        throw new Error(
+          `Ollama is unavailable and Gemini fallback failed: ${getErrorMessage(fallbackError)}`
+        )
+      }
+    }
   }
 
   // 2. Google Gemini (Cloud AI)
-  const isGenuineKey = (k?: string): boolean =>
-    typeof k === 'string' && k.trim().length > 10 && !k.includes('••••') && !k.includes('****')
-
-  const activeGeminiKey = isGenuineKey(config.geminiApiKey)
-    ? config.geminiApiKey!.trim()
-    : (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()) || ''
-
   if (modelSelection.provider === 'gemini' || config.aiProvider === 'gemini') {
     if (!activeGeminiKey) {
       throw new Error('Google Gemini API key is missing. Please set the GEMINI_API_KEY environment variable on your server or configure your key in Settings.')
     }
-    return await generateGeminiStream(
+    const geminiModel = modelSelection.modelName || process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+    const content = await generateGeminiStream(
       activeGeminiKey,
-      modelSelection.modelName || process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      geminiModel,
       finalSystemPrompt,
       fullPromptWithEvidence,
       effectiveHistory,
       onToken,
       signal
     )
+    options.onProviderUsed?.('gemini', geminiModel)
+    console.info(`[AIService] Request handled by provider=gemini model=${geminiModel}.`)
+    return content
   }
 
   if (modelSelection.provider === 'openai' || config.aiProvider === 'openai') {
     if (!config.openaiApiKey) {
       throw new Error('OpenAI is selected but no API key is configured.')
     }
-    return await generateOpenAIStream(
+    const modelName = modelSelection.modelName || 'gpt-4o-mini'
+    const content = await generateOpenAIStream(
       config.openaiApiKey,
-      modelSelection.modelName || 'gpt-4o-mini',
+      modelName,
       undefined,
       finalSystemPrompt,
       fullPromptWithEvidence,
@@ -227,15 +316,19 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
       onToken,
       signal
     )
+    options.onProviderUsed?.('openai', modelName)
+    console.info(`[AIService] Request handled by provider=openai model=${modelName}.`)
+    return content
   }
 
   if (modelSelection.provider === 'groq' || config.aiProvider === 'groq') {
     if (!config.groqApiKey) {
       throw new Error('Groq is selected but no API key is configured.')
     }
-    return await generateOpenAIStream(
+    const modelName = modelSelection.modelName || 'llama-3.1-8b-instant'
+    const content = await generateOpenAIStream(
       config.groqApiKey,
-      modelSelection.modelName || 'llama-3.1-8b-instant',
+      modelName,
       'https://api.groq.com/openai/v1',
       finalSystemPrompt,
       fullPromptWithEvidence,
@@ -243,6 +336,9 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
       onToken,
       signal
     )
+    options.onProviderUsed?.('groq', modelName)
+    console.info(`[AIService] Request handled by provider=groq model=${modelName}.`)
+    return content
   }
 
   // 4. Fast Tier or Telugu Village Friend Banter:
@@ -250,7 +346,7 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
   // directly for instantaneous TTFT and zero external rate limits.
 
   // Built-in mode remains offline and never forwards chat content to a remote fallback.
-  return await generateContextualSmartResponse(
+  const content = await generateContextualSmartResponse(
     prompt,
     effectiveHistory,
     searchEvidence,
@@ -258,6 +354,9 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
     toolResults,
     onToken
   )
+  options.onProviderUsed?.('builtin', 'builtin')
+  console.info('[AIService] Request handled by provider=builtin.')
+  return content
 }
 
 /**
@@ -273,7 +372,8 @@ export async function generateOllamaStream(
   onToken?: (token: string) => void,
   isDetailRequested?: boolean,
   signal?: AbortSignal,
-  images: string[] = []
+  images: string[] = [],
+  connectionTimeoutMs = getOllamaConnectionTimeoutMs()
 ): Promise<string> {
   if (baseUrl === 'test-fail-url') {
     throw new Error(
@@ -291,7 +391,7 @@ export async function generateOllamaStream(
   const isLocalhostUrl = baseUrl.includes('127.0.0.1') || baseUrl.includes('localhost')
 
   if (isCloudHost && isLocalhostUrl) {
-    throw new Error(
+    throw new OllamaAvailabilityError(
       'Local AI (Ollama) runs on your personal computer and cannot be reached directly by the Netlify cloud deployment. Configure AI_API_BASE_URL (or OLLAMA_BASE_URL) to an HTTPS authenticated gateway that securely connects to the owner-hosted Ollama service, set OLLAMA_API_KEY in the server environment, and set OLLAMA_MODEL. Do not expose Ollama port 11434 publicly. Alternatively, explicitly select another provider or run Mana AI locally using "npm run dev".'
     )
   }
@@ -337,6 +437,14 @@ export async function generateOllamaStream(
 
   const endpoint = `${baseUrl.replace(/\/+$/, '')}/api/chat`
   let response: Response
+  const connectionController = new AbortController()
+  const connectionTimeout = setTimeout(
+    () => connectionController.abort(new DOMException('Ollama connection timed out.', 'TimeoutError')),
+    connectionTimeoutMs
+  )
+  const connectionSignal = signal
+    ? AbortSignal.any([signal, connectionController.signal])
+    : connectionController.signal
 
   try {
     response = await fetch(endpoint, {
@@ -361,31 +469,39 @@ export async function generateOllamaStream(
           num_predict: isDetailRequested ? 1024 : 256,
         },
       }),
-      signal: signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(60000)])
-        : AbortSignal.timeout(60000),
+      signal: connectionSignal,
     })
   } catch (err: any) {
+    clearTimeout(connectionTimeout)
     if (signal?.aborted) {
       throw signal.reason || new DOMException('The operation was aborted.', 'AbortError')
     }
-    const msg = (err?.message || '').toLowerCase()
-    if (msg.includes('fetch failed') || msg.includes('econnrefused') || msg.includes('connection refused') || msg.includes('enotfound')) {
-      if (isCloudHost) {
-        throw new Error(
-          `Unable to connect to the cloud AI backend at ${baseUrl}. Please verify that your AI host is online, reachable, and that AI_API_BASE_URL (or OLLAMA_BASE_URL) is configured correctly in Netlify Environment Variables.`
-        )
-      }
-      throw new Error(
-        `Ollama is not running on ${baseUrl}. Please start Ollama on your computer by launching the Ollama app or running "ollama serve" in Windows PowerShell.`
+    if (connectionController.signal.aborted || err?.name === 'TimeoutError' || err?.code === 'ETIMEDOUT') {
+      throw new OllamaAvailabilityError(
+        `Ollama connection timed out after ${connectionTimeoutMs} ms at ${baseUrl}.`
       )
     }
-    if (msg.includes('timeout') || msg.includes('timed out') || msg.includes('aborted')) {
-      throw new Error(
-        `Ollama request timed out after 60 seconds while loading or running model "${modelName}". Please ensure your computer or cloud host has sufficient RAM/GPU memory.`
+    const msg = (err?.message || '').toLowerCase()
+    if (
+      msg.includes('fetch failed') ||
+      msg.includes('econnrefused') ||
+      msg.includes('connection refused') ||
+      msg.includes('enotfound') ||
+      msg.includes('econnreset') ||
+      msg.includes('networkerror') ||
+      err?.code === 'ECONNREFUSED' ||
+      err?.code === 'ENOTFOUND' ||
+      err?.code === 'ECONNRESET'
+    ) {
+      throw new OllamaAvailabilityError(
+        isCloudHost
+          ? `Unable to connect to the configured Ollama gateway at ${baseUrl}.`
+          : `Ollama is not running or reachable at ${baseUrl}. Start Ollama or check its local connection.`
       )
     }
     throw new Error(`Failed to connect to Ollama at ${baseUrl}: ${err.message}`)
+  } finally {
+    clearTimeout(connectionTimeout)
   }
 
   if (!response.ok) {
@@ -395,6 +511,11 @@ export async function generateOllamaStream(
     } catch {}
 
     const errMessage = (errBody?.error || `HTTP ${response.status}`).toString()
+    if ([408, 502, 503, 504].includes(response.status)) {
+      throw new OllamaAvailabilityError(
+        `Ollama is unavailable (HTTP ${response.status}) at ${baseUrl}.`
+      )
+    }
     if (response.status === 404 || errMessage.toLowerCase().includes('not found')) {
       throw new Error(
         `Ollama model "${modelName}" is not installed. Run "ollama run ${modelName}" in Windows PowerShell to download and run it.`
@@ -404,7 +525,7 @@ export async function generateOllamaStream(
   }
 
   if (!response.body) {
-    throw new Error('Ollama returned an empty response body.')
+    throw new OllamaAvailabilityError('Ollama returned an empty response body.')
   }
 
   // Stream NDJSON chunks from Ollama
@@ -412,10 +533,21 @@ export async function generateOllamaStream(
   const decoder = new TextDecoder()
   let fullResponse = ''
   let buffer = ''
+  const streamTimeoutSignal = AbortSignal.timeout(60_000)
+  const streamSignal = signal
+    ? AbortSignal.any([signal, streamTimeoutSignal])
+    : streamTimeoutSignal
+  const streamAbortPromise = new Promise<never>((_resolve, reject) => {
+    streamSignal.addEventListener(
+      'abort',
+      () => reject(streamSignal.reason || new DOMException('Ollama stream timed out.', 'TimeoutError')),
+      { once: true }
+    )
+  })
 
   try {
     while (true) {
-      const { done, value } = await reader.read()
+      const { done, value } = await Promise.race([reader.read(), streamAbortPromise])
       if (done) break
 
       buffer += decoder.decode(value, { stream: true })
@@ -453,6 +585,24 @@ export async function generateOllamaStream(
       } catch {}
     }
   } catch (err: any) {
+    if (signal?.aborted) {
+      throw signal.reason || new DOMException('The operation was aborted.', 'AbortError')
+    }
+    if (streamTimeoutSignal.aborted || err?.name === 'TimeoutError' || err?.code === 'ETIMEDOUT') {
+      throw new OllamaAvailabilityError(
+        `Ollama response timed out after 60 seconds at ${baseUrl}.`
+      )
+    }
+    const message = (err?.message || '').toLowerCase()
+    if (
+      message.includes('fetch failed') ||
+      message.includes('econnrefused') ||
+      message.includes('connection refused') ||
+      message.includes('econnreset') ||
+      err?.code === 'ECONNRESET'
+    ) {
+      throw new OllamaAvailabilityError(`Ollama connection failed while streaming from ${baseUrl}.`)
+    }
     if (err.name === 'AbortError') {
       throw new Error('Ollama generation was cancelled.')
     }
