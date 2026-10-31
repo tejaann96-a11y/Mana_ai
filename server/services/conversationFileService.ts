@@ -84,7 +84,10 @@ export interface ConversationFileMatch {
   docTitle: string
 }
 
-const require = createRequire(import.meta.url)
+// Functions are bundled to CommonJS on Netlify, where import.meta.url is empty.
+const require = createRequire(
+  typeof __filename !== 'undefined' ? __filename : import.meta.url,
+)
 const englishOcrData = require('@tesseract.js-data/eng') as { langPath: string; gzip: boolean }
 
 const wordExtractorModule = require('word-extractor') as new () => {

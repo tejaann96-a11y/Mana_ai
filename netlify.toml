@@ -7,6 +7,19 @@
   NODE_VERSION = "20"
   NPM_FLAGS = "--legacy-peer-deps"
 
+[functions]
+  node_bundler = "esbuild"
+  # Shipped unbundled: native .node addons (canvas), packages that load their own
+  # files/workers at runtime (pdf-parse, tesseract.js), and modules loaded via createRequire.
+  external_node_modules = [
+    "@napi-rs/canvas",
+    "@napi-rs/canvas-linux-x64-gnu",
+    "pdf-parse",
+    "tesseract.js",
+    "@tesseract.js-data/eng",
+    "word-extractor",
+  ]
+
 [[redirects]]
   from = "/api/chat/stream"
   to = "/.netlify/functions/chat-stream"
