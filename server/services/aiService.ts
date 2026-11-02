@@ -1,4 +1,4 @@
-﻿import { GoogleGenerativeAI } from '@google/generative-ai'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import OpenAI from 'openai'
 import { randomUUID } from 'node:crypto'
 import { AppConfig, SearchEvidence, MemoryItem, IntentClassification } from '../types.js'
@@ -88,9 +88,11 @@ export function getOllamaStreamTimeoutMs(): number {
 
 export function getGeminiTimeoutMs(): number {
   const configuredTimeout = Number.parseInt(process.env.GEMINI_TIMEOUT_MS || '', 10)
+  // The deployed streaming Lambda has a 30s limit. Leave time for SSE cleanup.
+  const maximum = process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME ? 20_000 : 120_000
   return Number.isFinite(configuredTimeout) && configuredTimeout > 0
-    ? Math.min(configuredTimeout, 120_000)
-    : 40_000
+    ? Math.min(configuredTimeout, maximum)
+    : Math.min(40_000, maximum)
 }
 
 function isAvailabilityFailure(err: unknown): err is OllamaAvailabilityError {
@@ -107,12 +109,22 @@ function getProviderErrorCategory(err: unknown): string {
   if (error?.name === 'TimeoutError' || /timed?\s*out|timeout/i.test(error?.message || '')) return 'timeout'
   if (error?.status === 401 || error?.status === 403) return 'authentication'
   if (error?.status === 429) return 'rate_limited'
+  if (error?.status === 404) return 'model_unavailable'
+  if (error?.status && error.status >= 500) return 'service_unavailable'
   if (isAvailabilityFailure(err)) return 'unavailable'
   return 'provider_error'
 }
 
 function logProviderDiagnostic(requestId: string, data: Record<string, string | number | boolean>) {
   console.info(JSON.stringify({ event: 'ai_provider_diagnostic', requestId, ...data }))
+}
+
+function providerFailureDiagnostic(err: unknown): Record<string, string | number> {
+  const error = err as { status?: number }
+  return {
+    errorCategory: getProviderErrorCategory(err),
+    ...(error?.status ? { httpStatus: error.status } : {}),
+  }
 }
 
 /**
@@ -291,7 +303,7 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
       if (!isAvailabilityFailure(err) || ollamaEmittedContent) {
         logProviderDiagnostic(requestId, {
           provider: 'ollama',
-          errorCategory: getProviderErrorCategory(err),
+          ...providerFailureDiagnostic(err),
           durationMs: Date.now() - ollamaStartedAt,
           fallbackAttempted: false,
           status: 'failed',
@@ -302,7 +314,7 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
       logProviderDiagnostic(requestId, {
         provider: 'ollama',
         connectionResult: 'unavailable',
-        errorCategory: getProviderErrorCategory(err),
+        ...providerFailureDiagnostic(err),
         durationMs: Date.now() - ollamaStartedAt,
         fallbackAttempted: false,
         status: 'failed',
@@ -361,13 +373,18 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
         logProviderDiagnostic(requestId, {
           provider: 'gemini',
           model: geminiModel,
-          errorCategory: getProviderErrorCategory(fallbackError),
+          ...providerFailureDiagnostic(fallbackError),
           durationMs: Date.now() - geminiStartedAt,
           fallbackAttempted: true,
           status: 'failed',
         })
-        throw new Error(
-          `Ollama is unavailable and Gemini fallback failed: ${getErrorMessage(fallbackError)}`
+        throw Object.assign(
+          new Error(`Ollama is unavailable and Gemini fallback failed: ${getErrorMessage(fallbackError)}`),
+          {
+            cause: fallbackError,
+            status: (fallbackError as { status?: number })?.status,
+            name: (fallbackError as Error)?.name || 'Error',
+          }
         )
       }
     }
@@ -409,7 +426,7 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
       logProviderDiagnostic(requestId, {
         provider: 'gemini',
         model: geminiModel,
-        errorCategory: getProviderErrorCategory(err),
+        ...providerFailureDiagnostic(err),
         durationMs: Date.now() - geminiStartedAt,
         fallbackAttempted: false,
         status: 'failed',
@@ -945,6 +962,11 @@ export function classifyGeminiError(err: any): Error {
     err?.statusCode ||
     (rawMsg.match(/HTTP\s*(\d{3})/i) ? parseInt(rawMsg.match(/HTTP\s*(\d{3})/i)![1], 10) : undefined)
 
+  const failure = (message: string) => Object.assign(new Error(message), {
+    status,
+    name: err?.name === 'TimeoutError' ? 'TimeoutError' : 'Error',
+  })
+
   // 1. Invalid API Key
   if (
     lowerMsg.includes('api_key_invalid') ||
@@ -953,13 +975,13 @@ export function classifyGeminiError(err: any): Error {
     (status === 400 && lowerMsg.includes('key')) ||
     status === 401
   ) {
-    return new Error(
+    return failure(
       'Invalid Google Gemini API key. Please check the GEMINI_API_KEY environment variable in Netlify or configure your API key in Settings.'
     )
   }
 
   if (status === 400) {
-    return new Error(
+    return failure(
       'Google Gemini rejected this request (HTTP 400). Verify GEMINI_MODEL and the request configuration, then try again.'
     )
   }
@@ -972,7 +994,7 @@ export function classifyGeminiError(err: any): Error {
     lowerMsg.includes('has not been used in project') ||
     lowerMsg.includes('api not enabled')
   ) {
-    return new Error(
+    return failure(
       'Google Gemini permission error: Please ensure the Generative Language API is enabled in your Google Cloud / AI Studio project and your API key has appropriate permissions.'
     )
   }
@@ -984,8 +1006,8 @@ export function classifyGeminiError(err: any): Error {
     lowerMsg.includes('quota') ||
     lowerMsg.includes('rate limit')
   ) {
-    return new Error(
-      'Google Gemini rate limit / quota exceeded (15 requests/min on free tier). Please wait a moment before trying again.'
+    return failure(
+      'Google Gemini rate limit / quota exceeded (HTTP 429). Please wait a moment before trying again.'
     )
   }
 
@@ -997,27 +1019,19 @@ export function classifyGeminiError(err: any): Error {
     lowerMsg.includes('not supported') ||
     lowerMsg.includes('deprecated')
   ) {
-    return new Error(
+    return failure(
       `The requested Gemini model is not supported or has been deprecated. Please configure GEMINI_MODEL=${DEFAULT_GEMINI_CHAT_MODEL} in your server environment.`
     )
   }
 
-  // 5. Network / Service Unreachable (500, 502, 503, 504, fetch failed)
-  if (
-    status === 500 ||
-    status === 502 ||
-    status === 503 ||
-    status === 504 ||
-    lowerMsg.includes('fetch failed') ||
-    lowerMsg.includes('econnreset') ||
-    lowerMsg.includes('etimedout') ||
-    lowerMsg.includes('timeout') ||
-    err?.name === 'TimeoutError' ||
-    lowerMsg.includes('network')
-  ) {
-    return new Error(
-      'Google Gemini request timed out or the service is temporarily unavailable. Please try again.'
-    )
+  if (err?.name === 'TimeoutError' || lowerMsg.includes('timed out') || lowerMsg.includes('timeout') || lowerMsg.includes('etimedout')) {
+    return failure('Google Gemini request timed out. Please try again.')
+  }
+  if ([500, 502, 503, 504].includes(status)) {
+    return failure(`Google Gemini is temporarily unavailable (HTTP ${status}). Please try again later.`)
+  }
+  if (/fetch failed|econnreset|network|enotfound/.test(lowerMsg)) {
+    return failure('Cannot reach Google Gemini because of a network connection failure. Please try again.')
   }
 
   // 6. Generic Gemini Error (Safely strip any sensitive keys or query parameters)
@@ -1025,7 +1039,7 @@ export function classifyGeminiError(err: any): Error {
     .replace(/(?:key[=:]\s*|Bearer\s+)[A-Za-z0-9_-]{15,}/gi, '[REDACTED_KEY]')
     .replace(/AIza[A-Za-z0-9_-]{20,}/g, '[REDACTED_KEY]')
 
-  return new Error(`Gemini Error: ${sanitizedMsg || 'Unknown error occurred while contacting Gemini'}`)
+  return failure(`Gemini Error: ${sanitizedMsg || 'Unknown error occurred while contacting Gemini'}`)
 }
 
 export function normalizeGeminiChatHistory(
@@ -1098,14 +1112,25 @@ export async function generateGeminiStream(
     const result = await chat.sendMessageStream(prompt, { signal: requestSignal })
 
     let fullText = ''
-    for await (const chunk of result.stream) {
-      const chunkText = chunk.text()
-      if (chunkText) {
-        fullText += chunkText
-        onToken?.(chunkText)
-      }
+    const [, response] = await Promise.all([
+      (async () => {
+        for await (const chunk of result.stream) {
+          if (requestSignal.aborted) throw requestSignal.reason
+          const chunkText = chunk.text()
+          if (chunkText) {
+            fullText += chunkText
+            onToken?.(chunkText)
+          }
+        }
+      })(),
+      result.response,
+    ])
+    if (!response.candidates?.some(candidate => candidate.finishReason)) {
+      throw new Error('Google Gemini response stream ended before completion. Please retry your message.')
     }
-
+    if (!fullText.trim()) {
+      throw new Error('Google Gemini returned no text response. Please retry or rephrase your message.')
+    }
     return fullText
   } catch (err: any) {
     if (signal?.aborted) {
