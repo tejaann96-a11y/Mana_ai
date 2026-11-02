@@ -1,4 +1,5 @@
 import { AppConfig, SearchEvidence, ImageSearchEvidence, MemoryItem, SearchMode } from '../types.js'
+import { randomUUID } from 'node:crypto'
 import { configService, resolveOllamaBaseUrl } from './configService.js'
 import { authService } from './authService.js'
 import { memoryService } from './memoryService.js'
@@ -12,6 +13,7 @@ import { executeImageSearch, extractImageSearchQuery } from './imageSearchServic
 
 export interface ChatRequestOptions {
   prompt: string
+  requestId?: string
   history?: Array<{ role: 'user' | 'assistant'; content: string }>
   searchMode?: SearchMode
   reasoningMode?: 'fast' | 'thinking'
@@ -65,6 +67,7 @@ export async function orchestrateChat(
   }
 }> {
   const reqStart = Date.now()
+  const requestId = options.requestId || randomUUID()
   const { prompt, history = [], searchMode: reqSearchMode, reasoningMode: reqReasoningMode, authUser, signal } = options
 
   // 1. Strict Server Input Validation
@@ -436,6 +439,7 @@ export async function orchestrateChat(
   // 6. Generate AI Response
   const content = await generateAIResponse({
     prompt: cleanPrompt,
+    requestId,
     history,
     searchEvidence,
     memories: relevantMemories,

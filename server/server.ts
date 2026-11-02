@@ -1,4 +1,5 @@
 import express from 'express'
+import { randomUUID } from 'node:crypto'
 import cors from 'cors'
 import rateLimit from 'express-rate-limit'
 import multer from 'multer'
@@ -680,13 +681,26 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-transform')
   res.setHeader('Connection', 'keep-alive')
   res.setHeader('X-Accel-Buffering', 'no')
+  const requestId = randomUUID()
+  const primaryProvider = process.env.AI_PROVIDER || aiProvider || 'ollama'
+  console.info(JSON.stringify({ event: 'chat_request_started', requestId, primaryProvider }))
   const requestController = new AbortController()
+  const heartbeat = setInterval(() => {
+    if (!requestController.signal.aborted && !res.writableEnded && !res.destroyed) {
+      res.write(': keepalive\n\n')
+    }
+  }, 15_000)
+  heartbeat.unref()
   res.on('close', () => {
-    if (!res.writableEnded) requestController.abort()
+    clearInterval(heartbeat)
+    if (!res.writableEnded) {
+      requestController.abort()
+      console.info(JSON.stringify({ event: 'chat_request_finished', requestId, status: 'disconnected' }))
+    }
   })
+  res.flushHeaders()
+  res.write(': connected\n\n')
 
-  let outputStarted = false
-  const pendingEvents: string[] = []
   const writeEvent = (payload: string) => {
     res.write(payload)
     if (typeof (res as any).flush === 'function') {
@@ -695,24 +709,15 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
   }
   const sendEvent = (event: string, data: any) => {
     if (requestController.signal.aborted || res.writableEnded || res.destroyed) return
-    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-    if (!outputStarted && event !== 'token' && event !== 'error' && event !== 'done') {
-      pendingEvents.push(payload)
-      return
-    }
-    if (!outputStarted) {
-      outputStarted = true
-      for (const queuedEvent of pendingEvents) writeEvent(queuedEvent)
-      pendingEvents.length = 0
-    }
-    writeEvent(payload)
+    writeEvent(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   }
 
   const authUser = getAuthUser(req)
 
   try {
-    await orchestrateChat(
+    const result = await orchestrateChat(
       {
+        requestId,
         prompt,
         history,
         searchMode,
@@ -739,17 +744,31 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
         onToken: (token) => sendEvent('token', { token }),
         onDone: (data) => {
           sendEvent('done', data)
-          res.end()
         },
       }
     )
+    console.info(JSON.stringify({
+      event: 'chat_request_finished',
+      requestId,
+      provider: result.provider || primaryProvider,
+      model: result.model || '',
+      status: 'success',
+    }))
+    clearInterval(heartbeat)
+    if (!res.writableEnded) res.end()
   } catch (err: any) {
     if (requestController.signal.aborted) return
-    console.error('[Server] Chat stream error:', err.message)
+    console.error(JSON.stringify({
+      event: 'chat_request_finished',
+      requestId,
+      errorCategory: err?.name === 'TimeoutError' ? 'timeout' : 'request_error',
+      status: 'failed',
+    }))
     sendEvent('error', {
       message: err.message || 'An error occurred during response generation.',
     })
-    res.end()
+    clearInterval(heartbeat)
+    if (!res.writableEnded) res.end()
   }
 })
 

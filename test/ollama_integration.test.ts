@@ -411,6 +411,48 @@ async function main() {
     })
   })
 
+  await runTest('Ollama streaming disconnect cancels the provider response body', async () => {
+    const previousMode = process.env.NODE_ENV
+    const previousNetlify = process.env.NETLIFY
+    const originalFetch = globalThis.fetch
+    process.env.NODE_ENV = 'production'
+    delete process.env.NETLIFY
+    const controller = new AbortController()
+    let responseCancelled = false
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(streamController) {
+        streamController.enqueue(new TextEncoder().encode('{"message":{"content":"partial"}}\n'))
+      },
+      cancel() {
+        responseCancelled = true
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/x-ndjson' },
+    })
+
+    try {
+      await assert.rejects(
+        generateOllamaStream(
+          'http://127.0.0.1:59997',
+          'qwen2.5:3b',
+          'System prompt',
+          'Hello',
+          [],
+          () => controller.abort(),
+          false,
+          controller.signal,
+        ),
+        /aborted/i
+      )
+      assert.strictEqual(responseCancelled, true, 'Client disconnect must cancel the Ollama response body')
+    } finally {
+      globalThis.fetch = originalFetch
+      restoreEnv('NODE_ENV', previousMode)
+      restoreEnv('NETLIFY', previousNetlify)
+    }
+  })
+
   await runTest('Private file requests never use Gemini fallback', async () => {
     await withFallbackEnvironment(async () => {
       throw new TypeError('fetch failed')

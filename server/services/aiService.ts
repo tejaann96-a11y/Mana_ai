@@ -1,5 +1,6 @@
 ﻿import { GoogleGenerativeAI } from '@google/generative-ai'
 import OpenAI from 'openai'
+import { randomUUID } from 'node:crypto'
 import { AppConfig, SearchEvidence, MemoryItem, IntentClassification } from '../types.js'
 import { documentService, DocumentSearchResult } from './documentService.js'
 import { executeTool, ToolResult } from './toolService.js'
@@ -42,6 +43,7 @@ function getOpenAIClient(apiKey: string, baseURL?: string): OpenAI {
 
 export interface GenerationOptions {
   prompt: string
+  requestId?: string
   history?: Array<{ role: 'user' | 'assistant'; content: string }>
   searchEvidence?: SearchEvidence
   memories?: MemoryItem[]
@@ -69,8 +71,26 @@ export class OllamaAvailabilityError extends Error {
 export function getOllamaConnectionTimeoutMs(): number {
   const configuredTimeout = Number.parseInt(process.env.OLLAMA_CONNECTION_TIMEOUT_MS || '', 10)
   return Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? Math.min(configuredTimeout, 30_000)
+    : process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME
+      ? 2_500
+      : 8_000
+}
+
+export function getOllamaStreamTimeoutMs(): number {
+  const configuredTimeout = Number.parseInt(process.env.OLLAMA_STREAM_TIMEOUT_MS || '', 10)
+  return Number.isFinite(configuredTimeout) && configuredTimeout > 0
     ? Math.min(configuredTimeout, 120_000)
-    : 8_000
+    : process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME
+      ? 25_000
+      : 60_000
+}
+
+export function getGeminiTimeoutMs(): number {
+  const configuredTimeout = Number.parseInt(process.env.GEMINI_TIMEOUT_MS || '', 10)
+  return Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? Math.min(configuredTimeout, 120_000)
+    : 40_000
 }
 
 function isAvailabilityFailure(err: unknown): err is OllamaAvailabilityError {
@@ -82,6 +102,19 @@ function getErrorMessage(err: unknown): string {
   return String(err)
 }
 
+function getProviderErrorCategory(err: unknown): string {
+  const error = err as { name?: string; message?: string; status?: number }
+  if (error?.name === 'TimeoutError' || /timed?\s*out|timeout/i.test(error?.message || '')) return 'timeout'
+  if (error?.status === 401 || error?.status === 403) return 'authentication'
+  if (error?.status === 429) return 'rate_limited'
+  if (isAvailabilityFailure(err)) return 'unavailable'
+  return 'provider_error'
+}
+
+function logProviderDiagnostic(requestId: string, data: Record<string, string | number | boolean>) {
+  console.info(JSON.stringify({ event: 'ai_provider_diagnostic', requestId, ...data }))
+}
+
 /**
  * Reusable AI generation service supporting Google Gemini (Pro human-level thinking),
  * OpenAI, Groq, and a multi-turn contextual assistant engine that tracks full history.
@@ -89,6 +122,7 @@ function getErrorMessage(err: unknown): string {
 export async function generateAIResponse(options: GenerationOptions): Promise<string> {
   const {
     prompt,
+    requestId = randomUUID(),
     history = [],
     searchEvidence,
     memories = [],
@@ -140,6 +174,12 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
   const intent = classifyIntent(prompt, effectiveHistory)
   const taskTier = determineTaskTier(prompt, intent, reasoningMode)
   const modelSelection = selectModelForTask(taskTier, config, intent)
+  logProviderDiagnostic(requestId, {
+    primaryProvider: modelSelection.provider,
+    selectedModel: modelSelection.modelName,
+    fallbackAttempted: false,
+    status: 'selected',
+  })
   const isGenuineKey = (key?: string): boolean =>
     typeof key === 'string' && key.trim().length > 10 && !key.includes('••••') && !key.includes('****')
   const activeGeminiKey = isGenuineKey(config.geminiApiKey)
@@ -214,6 +254,12 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
     const finalOllamaSystemPrompt = `${resolvedRefsPrefix}${ollamaSystemPrompt}\n\n${dateTimeContext}`
 
     let ollamaEmittedContent = false
+    const ollamaStartedAt = Date.now()
+    logProviderDiagnostic(requestId, {
+      provider: 'ollama',
+      model: ollamaModel,
+      phase: 'request_started',
+    })
     try {
       const content = await generateOllamaStream(
         ollamaBaseUrl,
@@ -230,16 +276,37 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
         images
       )
       options.onProviderUsed?.('ollama', ollamaModel)
-      console.info(`[AIService] Request handled by provider=ollama model=${ollamaModel}.`)
+      logProviderDiagnostic(requestId, {
+        provider: 'ollama',
+        connectionResult: 'available',
+        durationMs: Date.now() - ollamaStartedAt,
+        fallbackAttempted: false,
+        status: 'success',
+      })
       return content
     } catch (err) {
       if (signal?.aborted) {
         throw signal.reason || err
       }
       if (!isAvailabilityFailure(err) || ollamaEmittedContent) {
+        logProviderDiagnostic(requestId, {
+          provider: 'ollama',
+          errorCategory: getProviderErrorCategory(err),
+          durationMs: Date.now() - ollamaStartedAt,
+          fallbackAttempted: false,
+          status: 'failed',
+        })
         throw err
       }
 
+      logProviderDiagnostic(requestId, {
+        provider: 'ollama',
+        connectionResult: 'unavailable',
+        errorCategory: getProviderErrorCategory(err),
+        durationMs: Date.now() - ollamaStartedAt,
+        fallbackAttempted: false,
+        status: 'failed',
+      })
       const fallbackEnabled =
         process.env.AI_FALLBACK_ENABLED?.trim().toLowerCase() === 'true'
       const fallbackProvider = process.env.AI_FALLBACK_PROVIDER?.trim().toLowerCase()
@@ -260,8 +327,14 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
 
       const geminiModel = resolveGeminiChatModel()
       const fallbackMessage = `Ollama is unavailable; using configured Gemini fallback (${geminiModel}).`
-      console.warn('[AIService] Ollama is unavailable; attempting configured Gemini fallback.')
+      logProviderDiagnostic(requestId, {
+        provider: 'gemini',
+        model: geminiModel,
+        fallbackAttempted: true,
+        status: 'request_started',
+      })
       options.onProviderFallback?.({ from: 'ollama', to: 'gemini', message: fallbackMessage })
+      const geminiStartedAt = Date.now()
       try {
         const content = await generateGeminiStream(
           activeGeminiKey,
@@ -273,12 +346,26 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
           signal
         )
         options.onProviderUsed?.('gemini', geminiModel)
-        console.info(`[AIService] Request handled by provider=gemini model=${geminiModel} (fallback).`)
+        logProviderDiagnostic(requestId, {
+          provider: 'gemini',
+          model: geminiModel,
+          durationMs: Date.now() - geminiStartedAt,
+          fallbackAttempted: true,
+          status: 'success',
+        })
         return content
       } catch (fallbackError) {
         if (signal?.aborted) {
           throw signal.reason || fallbackError
         }
+        logProviderDiagnostic(requestId, {
+          provider: 'gemini',
+          model: geminiModel,
+          errorCategory: getProviderErrorCategory(fallbackError),
+          durationMs: Date.now() - geminiStartedAt,
+          fallbackAttempted: true,
+          status: 'failed',
+        })
         throw new Error(
           `Ollama is unavailable and Gemini fallback failed: ${getErrorMessage(fallbackError)}`
         )
@@ -292,18 +379,43 @@ export async function generateAIResponse(options: GenerationOptions): Promise<st
       throw new Error('Google Gemini API key is missing. Please set the GEMINI_API_KEY environment variable on your server or configure your key in Settings.')
     }
     const geminiModel = resolveGeminiChatModel(modelSelection.modelName)
-    const content = await generateGeminiStream(
-      activeGeminiKey,
-      geminiModel,
-      finalSystemPrompt,
-      fullPromptWithEvidence,
-      effectiveHistory,
-      onToken,
-      signal
-    )
-    options.onProviderUsed?.('gemini', geminiModel)
-    console.info(`[AIService] Request handled by provider=gemini model=${geminiModel}.`)
-    return content
+    const geminiStartedAt = Date.now()
+    logProviderDiagnostic(requestId, {
+      provider: 'gemini',
+      model: geminiModel,
+      fallbackAttempted: false,
+      status: 'request_started',
+    })
+    try {
+      const content = await generateGeminiStream(
+        activeGeminiKey,
+        geminiModel,
+        finalSystemPrompt,
+        fullPromptWithEvidence,
+        effectiveHistory,
+        onToken,
+        signal
+      )
+      options.onProviderUsed?.('gemini', geminiModel)
+      logProviderDiagnostic(requestId, {
+        provider: 'gemini',
+        model: geminiModel,
+        durationMs: Date.now() - geminiStartedAt,
+        fallbackAttempted: false,
+        status: 'success',
+      })
+      return content
+    } catch (err) {
+      logProviderDiagnostic(requestId, {
+        provider: 'gemini',
+        model: geminiModel,
+        errorCategory: getProviderErrorCategory(err),
+        durationMs: Date.now() - geminiStartedAt,
+        fallbackAttempted: false,
+        status: 'failed',
+      })
+      throw err
+    }
   }
 
   if (modelSelection.provider === 'openai' || config.aiProvider === 'openai') {
@@ -538,7 +650,8 @@ export async function generateOllamaStream(
   const decoder = new TextDecoder()
   let fullResponse = ''
   let buffer = ''
-  const streamTimeoutSignal = AbortSignal.timeout(60_000)
+  const streamTimeoutMs = getOllamaStreamTimeoutMs()
+  const streamTimeoutSignal = AbortSignal.timeout(streamTimeoutMs)
   const streamSignal = signal
     ? AbortSignal.any([signal, streamTimeoutSignal])
     : streamTimeoutSignal
@@ -590,12 +703,17 @@ export async function generateOllamaStream(
       } catch {}
     }
   } catch (err: any) {
+    try {
+      await reader.cancel()
+    } catch {
+      // The response body may already be closed by the provider.
+    }
     if (signal?.aborted) {
       throw signal.reason || new DOMException('The operation was aborted.', 'AbortError')
     }
     if (streamTimeoutSignal.aborted || err?.name === 'TimeoutError' || err?.code === 'ETIMEDOUT') {
       throw new OllamaAvailabilityError(
-        `Ollama response timed out after 60 seconds at ${baseUrl}.`
+        `Ollama response timed out after ${streamTimeoutMs} ms at ${baseUrl}.`
       )
     }
     const message = (err?.message || '').toLowerCase()
@@ -840,6 +958,12 @@ export function classifyGeminiError(err: any): Error {
     )
   }
 
+  if (status === 400) {
+    return new Error(
+      'Google Gemini rejected this request (HTTP 400). Verify GEMINI_MODEL and the request configuration, then try again.'
+    )
+  }
+
   // 2. Permission Denied / API Not Enabled (403)
   if (
     status === 403 ||
@@ -887,10 +1011,12 @@ export function classifyGeminiError(err: any): Error {
     lowerMsg.includes('fetch failed') ||
     lowerMsg.includes('econnreset') ||
     lowerMsg.includes('etimedout') ||
+    lowerMsg.includes('timeout') ||
+    err?.name === 'TimeoutError' ||
     lowerMsg.includes('network')
   ) {
     return new Error(
-      'Google Gemini service is temporarily unreachable. Please check your internet connection and try again.'
+      'Google Gemini request timed out or the service is temporarily unavailable. Please try again.'
     )
   }
 
@@ -925,8 +1051,8 @@ export function normalizeGeminiChatHistory(
 }
 
 /**
- * Streams response using Google Gemini with dynamic model discovery,
- * multi-turn history, model fallback, bounded retries, and clean error handling.
+ * Streams one configured conversational Gemini model with multi-turn history
+ * and a bounded request timeout.
  */
 export async function generateGeminiStream(
   apiKey: string,
@@ -939,6 +1065,9 @@ export async function generateGeminiStream(
 ): Promise<string> {
   const cleanRequestedModel = resolveGeminiChatModel(modelName)
   const chatHistory = normalizeGeminiChatHistory(history)
+  if (signal?.aborted) {
+    throw signal.reason || new DOMException('The operation was aborted.', 'AbortError')
+  }
 
   // Support safe offline test mock without consuming real API quota
   if (apiKey === 'test-mock-key') {
@@ -954,150 +1083,42 @@ export async function generateGeminiStream(
     return mockReply
   }
 
-  // 1. Dynamically query available models supporting generateContent for this API key
-  let availableModels: string[] = []
+  const timeoutMs = getGeminiTimeoutMs()
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const requestSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal
+
   try {
-    availableModels = await getSupportedGeminiModels(apiKey, signal)
+    const model = getGeminiClient(apiKey).getGenerativeModel({
+      model: cleanRequestedModel,
+      systemInstruction,
+    })
+    const chat = model.startChat({ history: chatHistory })
+    const result = await chat.sendMessageStream(prompt, { signal: requestSignal })
+
+    let fullText = ''
+    for await (const chunk of result.stream) {
+      const chunkText = chunk.text()
+      if (chunkText) {
+        fullText += chunkText
+        onToken?.(chunkText)
+      }
+    }
+
+    return fullText
   } catch (err: any) {
     if (signal?.aborted) {
       throw signal.reason || err
     }
-    if (
-      err.message?.includes('Invalid Google Gemini API key') ||
-      err.message?.includes('permission error') ||
-      err.message?.includes('rate limit')
-    ) {
-      throw err
+    if (timeoutSignal.aborted) {
+      throw classifyGeminiError({
+        name: 'TimeoutError',
+        message: `Gemini request timed out after ${timeoutMs} ms.`,
+      })
     }
-    console.warn('[AIService] Gemini model discovery unavailable; continuing with configured chat model.')
+    throw classifyGeminiError(err)
   }
-
-  // 2. Build prioritized candidate models list:
-  const candidateModels: string[] = []
-
-  // (a) If requested model is verified available (or if discovery was unavailable), prioritize it
-  if (cleanRequestedModel && (availableModels.length === 0 || availableModels.includes(cleanRequestedModel))) {
-    candidateModels.push(cleanRequestedModel)
-  }
-
-  // (b) Add any active Flash models discovered from the API key
-  if (availableModels.length > 0) {
-    const flashModels = availableModels.filter(
-      (m) => isGeminiChatModel(m) && (m.includes('flash') || m.includes('lite')) && m !== cleanRequestedModel
-    )
-    candidateModels.push(...flashModels)
-
-    // Add Pro models as secondary reasoning backups
-    const proModels = availableModels.filter(
-      (m) => isGeminiChatModel(m) && m.includes('pro') && m !== cleanRequestedModel && !candidateModels.includes(m)
-    )
-    candidateModels.push(...proModels)
-  }
-
-  // (c) Add default modern candidate fallbacks in priority order
-  const defaultFallbacks = [
-    cleanRequestedModel,
-    DEFAULT_GEMINI_CHAT_MODEL,
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
-    'gemini-2.5-pro',
-    'gemini-1.5-pro',
-  ]
-  for (const fb of defaultFallbacks) {
-    if (fb && !candidateModels.includes(fb)) {
-      candidateModels.push(fb)
-    }
-  }
-
-  const genAI = getGeminiClient(apiKey)
-
-  let lastError: any = null
-  for (const candidate of candidateModels) {
-    let attempt = 0
-    const maxRetries = 1
-
-    while (attempt <= maxRetries) {
-      try {
-        const model = genAI.getGenerativeModel({
-          model: candidate,
-          systemInstruction,
-        })
-
-        const chat = model.startChat({ history: chatHistory })
-        const result = await chat.sendMessageStream(prompt, { signal })
-
-        let fullText = ''
-        for await (const chunk of result.stream) {
-          const chunkText = chunk.text()
-          if (chunkText) {
-            fullText += chunkText
-            if (onToken) onToken(chunkText)
-          }
-        }
-
-        return fullText
-      } catch (err: any) {
-        if (signal?.aborted) {
-          throw signal.reason || err
-        }
-        lastError = err
-        const msg = (err?.message || '').toLowerCase()
-        const status = err?.status || err?.statusCode
-
-        // 1. If candidate model not found or deprecated, try next candidate model immediately
-        if (msg.includes('404') || msg.includes('not found') || msg.includes('deprecated') || status === 404) {
-          console.warn(`[AIService] Gemini model "${candidate}" unavailable, trying next candidate...`)
-          break
-        }
-
-        // 2. Invalid API key or permission error: fail immediately without retrying
-        if (
-          msg.includes('api_key_invalid') ||
-          msg.includes('api key not valid') ||
-          (status === 400 && msg.includes('key')) ||
-          status === 401 ||
-          status === 403 ||
-          msg.includes('permission_denied')
-        ) {
-          throw classifyGeminiError(err)
-        }
-
-        // 3. Quota exhaustion: fail fast or fallback from Pro to Flash (never loop infinitely!)
-        if (msg.includes('resource_exhausted') || msg.includes('quota') || status === 429) {
-          if (candidate.includes('pro')) {
-            console.warn(`[AIService] Gemini Pro quota exhausted, attempting Flash fallback...`)
-            break
-          }
-          throw classifyGeminiError(err)
-        }
-
-        // 4. Transient network error: bounded retry with backoff
-        const isTransient =
-          msg.includes('fetch failed') ||
-          msg.includes('network') ||
-          msg.includes('econnreset') ||
-          msg.includes('timeout') ||
-          status === 503 ||
-          status === 500
-
-        if (isTransient && attempt < maxRetries) {
-          attempt++
-          const backoff = attempt * 800
-          console.warn(
-            `[AIService] Transient error on Gemini model "${candidate}" (attempt ${attempt}/${maxRetries}), retrying in ${backoff}ms...`
-          )
-          await new Promise((r) => setTimeout(r, backoff))
-          continue
-        }
-
-        // Non-transient or retries exhausted
-        throw classifyGeminiError(err)
-      }
-    }
-  }
-
-  throw classifyGeminiError(lastError || new Error('All candidate Gemini models failed.'))
 }
 
 /**

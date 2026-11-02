@@ -1052,7 +1052,7 @@ export const App: React.FC = () => {
     }
   }
 
-  const handleSendMessage = async (customPrompt?: string) => {
+  const handleSendMessage = async (customPrompt?: string, retryUserMessageId?: string) => {
     const promptToSend = (customPrompt || input).trim()
     if (!promptToSend || isGeneratingRef.current) return
     if (stagedAttachments.some((attachment) => attachment.status !== 'complete')) return
@@ -1082,26 +1082,34 @@ export const App: React.FC = () => {
       currentSessionIdRef.current = activeSessionId
     }
 
-    const userMessage: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: promptToSend,
-      timestamp: Date.now(),
-      attachments: stagedAttachments
-        .filter((attachment) => attachment.status === 'complete')
-        .map(({ id, name, mimeType, sizeBytes, uploadedAt, extractionStatus, extractionNote, pageCount, worksheets, chunkCount }) => ({
-          id,
-          name,
-          mimeType,
-          sizeBytes,
-          uploadedAt: uploadedAt || new Date().toISOString(),
-          extractionStatus: extractionStatus || 'complete',
-          extractionNote,
-          pageCount,
-          worksheets,
-          chunkCount: chunkCount || 0,
-        })),
-    }
+    const retryUserMessageIndex = retryUserMessageId
+      ? messages.findIndex((message) => message.id === retryUserMessageId && message.role === 'user')
+      : -1
+    const messagesBeforeRetry = retryUserMessageIndex >= 0
+      ? messages.slice(0, retryUserMessageIndex)
+      : messages
+    const userMessage: Message = retryUserMessageIndex >= 0
+      ? { ...messages[retryUserMessageIndex], content: promptToSend }
+      : {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: promptToSend,
+          timestamp: Date.now(),
+          attachments: stagedAttachments
+            .filter((attachment) => attachment.status === 'complete')
+            .map(({ id, name, mimeType, sizeBytes, uploadedAt, extractionStatus, extractionNote, pageCount, worksheets, chunkCount }) => ({
+              id,
+              name,
+              mimeType,
+              sizeBytes,
+              uploadedAt: uploadedAt || new Date().toISOString(),
+              extractionStatus: extractionStatus || 'complete',
+              extractionNote,
+              pageCount,
+              worksheets,
+              chunkCount: chunkCount || 0,
+            })),
+        }
     const sentAttachmentIds = new Set((userMessage.attachments || []).map((attachment) => attachment.id))
 
     const assistantId = `assistant-${Date.now()}`
@@ -1114,13 +1122,13 @@ export const App: React.FC = () => {
       isSearching: false,
     }
 
-    const nextMessages = [...messages, userMessage, assistantMessage]
+    const nextMessages = [...messagesBeforeRetry, userMessage, assistantMessage]
     shouldAutoScrollRef.current = true
     setMessages(nextMessages)
     setIsGenerating(true)
 
     // Context window: send last 16 turns preserving full locality names and context
-    const history = messages.slice(-16).map((m) => ({
+    const history = messagesBeforeRetry.slice(-16).map((m) => ({
       role: m.role,
       content: m.content.length > 2500 ? m.content.slice(0, 2500) + '...' : m.content,
     }))
@@ -1178,6 +1186,7 @@ export const App: React.FC = () => {
       let finalContent = ''
       let finalEvidence = undefined
       let finalImageSearchEvidence = undefined
+      let receivedTerminalEvent = false
 
       // Ultra-fast batched state updater for 60fps streaming rendering
       const currentAssistantState: Partial<Message> = {
@@ -1298,6 +1307,7 @@ export const App: React.FC = () => {
                 break
 
               case 'done':
+                receivedTerminalEvent = true
                 currentAssistantState.isStreaming = false
                 currentAssistantState.isSearching = false
                 currentAssistantState.reasoningMode = parsed.reasoningMode
@@ -1319,6 +1329,7 @@ export const App: React.FC = () => {
                 break
 
               case 'error':
+                receivedTerminalEvent = true
                 currentAssistantState.isStreaming = false
                 currentAssistantState.isSearching = false
                 currentAssistantState.content =
@@ -1338,6 +1349,12 @@ export const App: React.FC = () => {
         }
       }
 
+      if (!receivedTerminalEvent) {
+        await reader.cancel()
+        flushAssistantState(true)
+        throw new Error('The chat response stream ended before completion. Please retry your message.')
+      }
+
       // Final flush guaranteeing all state is committed immediately
       flushAssistantState(true)
 
@@ -1351,7 +1368,7 @@ export const App: React.FC = () => {
         isStreaming: false,
         isSearching: false,
       }
-      const allCurrentMsgs = [...messages, userMessage, completedAssistantMsg]
+      const allCurrentMsgs = [...messagesBeforeRetry, userMessage, completedAssistantMsg]
       saveSessionMessages(activeSessionId, allCurrentMsgs)
       setStagedAttachments((previous) => {
         const remaining = previous.filter((attachment) => !sentAttachmentIds.has(attachment.id))
@@ -1404,10 +1421,9 @@ export const App: React.FC = () => {
     if (isGenerating) return
     const idx = messages.findIndex((m) => m.id === assistantMsgId)
     if (idx > 0) {
-      const userPrompt = messages[idx - 1]?.content
-      if (userPrompt) {
-        setMessages((prev) => prev.filter((m) => m.id !== assistantMsgId))
-        handleSendMessage(userPrompt)
+      const userMessage = messages.slice(0, idx).reverse().find((message) => message.role === 'user')
+      if (userMessage?.content) {
+        handleSendMessage(userMessage.content, userMessage.id)
       }
     }
   }

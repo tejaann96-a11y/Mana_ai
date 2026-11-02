@@ -114,6 +114,90 @@ async function main() {
     )
   })
 
+  await runTest('Gemini request maps HTTP failures without trying alternate models', async () => {
+    const previousModel = process.env.GEMINI_MODEL
+    const originalFetch = globalThis.fetch
+    process.env.GEMINI_MODEL = DEFAULT_GEMINI_CHAT_MODEL
+    const cases = [
+      { status: 400, message: 'Invalid request body', expected: /rejected this request/ },
+      { status: 401, message: 'Unauthorized', expected: /Invalid Google Gemini API key/ },
+      { status: 403, message: 'Permission denied', expected: /permission error/ },
+      { status: 429, message: 'Quota exceeded', expected: /rate limit \/ quota exceeded/ },
+      { status: 500, message: 'Internal error', expected: /temporarily unavailable/ },
+      { status: 503, message: 'Service unavailable', expected: /temporarily unavailable/ },
+    ]
+
+    try {
+      for (const testCase of cases) {
+        let requestCount = 0
+        let requestUrl = ''
+        globalThis.fetch = async (input) => {
+          requestCount++
+          requestUrl = String(input)
+          return new Response(JSON.stringify({
+            error: { code: testCase.status, message: testCase.message },
+          }), {
+            status: testCase.status,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+
+        await assert.rejects(
+          generateGeminiStream(
+            'mock-gemini-api-key',
+            DEFAULT_GEMINI_CHAT_MODEL,
+            'system',
+            'Hello',
+            [{ role: 'user', content: 'Earlier question' }],
+          ),
+          testCase.expected
+        )
+        assert.strictEqual(requestCount, 1, `HTTP ${testCase.status} must not retry or select another model`)
+        assert(
+          requestUrl.includes(`/v1beta/models/${DEFAULT_GEMINI_CHAT_MODEL}:streamGenerateContent`),
+          `Must call the configured chat stream endpoint, got ${requestUrl}`
+        )
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+      if (previousModel === undefined) delete process.env.GEMINI_MODEL
+      else process.env.GEMINI_MODEL = previousModel
+    }
+  })
+
+  await runTest('Gemini timeout cancels its mocked API request and returns an actionable error', async () => {
+    const previousTimeout = process.env.GEMINI_TIMEOUT_MS
+    const originalFetch = globalThis.fetch
+    process.env.GEMINI_TIMEOUT_MS = '25'
+    globalThis.fetch = async (_input, init) => await new Promise<Response>((_resolve, reject) => {
+      const requestSignal = init?.signal
+      const keepAlive = setTimeout(() => reject(new Error('Mock request was not aborted')), 1_000)
+      const rejectOnAbort = () => {
+        clearTimeout(keepAlive)
+        reject(requestSignal?.reason || new DOMException('Aborted', 'AbortError'))
+      }
+      if (requestSignal?.aborted) rejectOnAbort()
+      else requestSignal?.addEventListener('abort', rejectOnAbort, { once: true })
+    })
+
+    try {
+      await assert.rejects(
+        generateGeminiStream(
+          'mock-gemini-api-key',
+          DEFAULT_GEMINI_CHAT_MODEL,
+          'system',
+          'Hello',
+          [],
+        ),
+        /timed out or the service is temporarily unavailable/
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      if (previousTimeout === undefined) delete process.env.GEMINI_TIMEOUT_MS
+      else process.env.GEMINI_TIMEOUT_MS = previousTimeout
+    }
+  })
+
   // TEST 5: Gemini selection actually invokes the Gemini service
   await runTest('Test 5: Gemini provider selection actually routes to Gemini model', () => {
     const cfg = { ...configService.getConfig(), aiProvider: 'gemini' as const }
