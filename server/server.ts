@@ -765,6 +765,9 @@ app.post('/api/chat/stream', chatLimiter, async (req, res) => {
       status: 'failed',
     }))
     sendEvent('error', {
+      code: err?.name === 'TimeoutError' ? 'provider_timeout' : 'provider_error',
+      requestId,
+      ...(err?.status ? { status: err.status } : {}),
       message: err.message || 'An error occurred during response generation.',
     })
     clearInterval(heartbeat)

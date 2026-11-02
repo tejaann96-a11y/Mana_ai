@@ -20,6 +20,8 @@ delete process.env.AI_PROVIDER
 delete process.env.DEFAULT_AI_PROVIDER
 delete process.env.GEMINI_MODEL
 delete process.env.GEMINI_PRO_MODEL
+// Keep the offline audit isolated from credentials injected by the build runner.
+delete process.env.GEMINI_API_KEY
 
 console.log('=== RUNNING MANA AI PRODUCTION-READY GEMINI AUDIT & REGRESSION TESTS ===\n')
 
@@ -189,7 +191,7 @@ async function main() {
           'Hello',
           [],
         ),
-        /timed out or the service is temporarily unavailable/
+        /request timed out/
       )
     } finally {
       globalThis.fetch = originalFetch

@@ -5,7 +5,7 @@ import { connectLambda } from '@netlify/blobs'
 import { orchestrateChat } from '../../server/services/chatOrchestrator.js'
 import { authService } from '../../server/services/authService.js'
 
-export const handler = stream(async (event, _context) => {
+export const handleChatStream: Parameters<typeof stream>[0] = async (event, _context) => {
   // Connect Netlify Blobs runtime context
   try {
     connectLambda(event)
@@ -36,7 +36,7 @@ export const handler = stream(async (event, _context) => {
     groqApiKey,
   } = body
 
-  if (!prompt || typeof prompt !== 'string') {
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim() || !Array.isArray(history)) {
     return {
       statusCode: 400,
       headers: { 'Content-Type': 'application/json' },
@@ -61,9 +61,12 @@ export const handler = stream(async (event, _context) => {
 
   const passThrough = new PassThrough()
   const requestController = new AbortController()
+  const startedAt = Date.now()
+  let deadline: ReturnType<typeof setTimeout> | undefined
   let heartbeat: ReturnType<typeof setInterval> | undefined
   passThrough.on('close', () => {
     clearInterval(heartbeat)
+    clearTimeout(deadline)
     if (!passThrough.writableEnded) {
       requestController.abort()
       console.info(JSON.stringify({ event: 'chat_request_finished', requestId, status: 'disconnected' }))
@@ -79,14 +82,29 @@ export const handler = stream(async (event, _context) => {
   heartbeat.unref()
 
   const sendEvent = (eventType: string, data: any) => {
-    if (requestController.signal.aborted || passThrough.destroyed) return
+    if (requestController.signal.aborted || passThrough.destroyed || passThrough.writableEnded) return
     passThrough.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`)
   }
 
   const endStream = () => {
     clearInterval(heartbeat)
+    clearTimeout(deadline)
     if (!passThrough.writableEnded && !passThrough.destroyed) passThrough.end()
   }
+
+  // Production logs show a 30s streaming limit. This covers orchestration and
+  // both providers together, even if an upstream stream does not settle on abort.
+  deadline = setTimeout(() => {
+    sendEvent('error', {
+      code: 'request_timeout',
+      requestId,
+      message: 'The AI providers did not complete within the response time limit. Please retry your message.',
+    })
+    console.warn(JSON.stringify({ event: 'chat_request_finished', requestId, status: 'failed', errorCategory: 'timeout', durationMs: Date.now() - startedAt }))
+    endStream()
+    requestController.abort(new DOMException('Chat request deadline exceeded.', 'TimeoutError'))
+  }, 25_000)
+  deadline.unref()
 
   void (async () => {
     try {
@@ -118,12 +136,14 @@ export const handler = stream(async (event, _context) => {
           onDone: (data) => sendEvent('done', data),
         }
       )
+      if (requestController.signal.aborted) return
       console.info(JSON.stringify({
         event: 'chat_request_finished',
         requestId,
         provider: result.provider || primaryProvider,
         model: result.model || '',
         status: 'success',
+        durationMs: Date.now() - startedAt,
       }))
       endStream()
     } catch (err: any) {
@@ -133,8 +153,13 @@ export const handler = stream(async (event, _context) => {
         requestId,
         errorCategory: err?.name === 'TimeoutError' ? 'timeout' : 'request_error',
         status: 'failed',
+        durationMs: Date.now() - startedAt,
+        ...(err?.status ? { httpStatus: err.status } : {}),
       }))
       sendEvent('error', {
+        code: err?.name === 'TimeoutError' ? 'provider_timeout' : 'provider_error',
+        requestId,
+        ...(err?.status ? { status: err.status } : {}),
         message: err.message || 'An error occurred during response generation.',
       })
       endStream()
@@ -152,4 +177,6 @@ export const handler = stream(async (event, _context) => {
     },
     body: passThrough,
   }
-})
+}
+
+export const handler = stream(handleChatStream)
